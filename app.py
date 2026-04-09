@@ -1,10 +1,9 @@
 from flask import Flask, render_template, request, redirect, session
-import psycopg2
-from urllib.parse import urlparse
+import sqlite3
 import os
 import datetime
-
 from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.secret_key = "chave_super_secreta"
@@ -18,31 +17,23 @@ HORARIOS_POSSIVEIS = [
 ]
 
 # -------------------
-# CONEXÃO COM POSTGRES
+# CONEXÃO COM SQLITE
 # -------------------
 def conectar_bd():
-    url = os.environ.get("DATABASE_URL")
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://")
-    result = urlparse(url)
-    return psycopg2.connect(
-        dbname=result.path[1:],
-        user=result.username,
-        password=result.password,
-        host=result.hostname,
-        port=result.port
-    )
+    conn = sqlite3.connect("banco.db")
+    conn.row_factory = sqlite3.Row
+    return conn
 
 # -------------------
 # CRIAÇÃO DAS TABELAS
 # -------------------
-def criar_tabelas_postgres():
+def criar_tabelas():
     conn = conectar_bd()
     cursor = conn.cursor()
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS agendamentos (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT,
             telefone TEXT,
             data TEXT,
@@ -53,7 +44,7 @@ def criar_tabelas_postgres():
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS bloqueios (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             data TEXT,
             horario TEXT,
             motivo TEXT
@@ -62,7 +53,7 @@ def criar_tabelas_postgres():
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS usuarios (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             senha TEXT NOT NULL
         );
@@ -70,8 +61,10 @@ def criar_tabelas_postgres():
 
     cursor.execute("SELECT * FROM usuarios WHERE username = 'admin'")
     if not cursor.fetchone():
-        cursor.execute("INSERT INTO usuarios (username, senha) VALUES (%s, %s)", ('admin', '1234'))
-
+        cursor.execute(
+            "INSERT INTO usuarios (username, senha) VALUES (?, ?)",
+            ('admin', generate_password_hash('1234'))
+        )
     conn.commit()
     conn.close()
 
@@ -102,11 +95,11 @@ def login():
 
         conn = conectar_bd()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM usuarios WHERE username = %s AND senha = %s", (usuario, senha))
-        resultado = cursor.fetchone()
+        cursor.execute("SELECT * FROM usuarios WHERE username = ?", (usuario,))
+        usuario_bd = cursor.fetchone()
         conn.close()
 
-        if resultado:
+        if usuario_bd and check_password_hash(usuario_bd["senha"], senha):
             session["usuario"] = usuario
             return redirect("/agendamentos")
         else:
@@ -131,32 +124,37 @@ def agendar():
         conn = conectar_bd()
         cursor = conn.cursor()
 
-        cursor.execute("SELECT COUNT(*) FROM agendamentos WHERE data = %s AND horario = %s", (data, horario))
+        cursor.execute("SELECT COUNT(*) FROM agendamentos WHERE data = ? AND horario = ?", (data, horario))
         agendado = cursor.fetchone()[0]
 
-        cursor.execute("SELECT COUNT(*) FROM bloqueios WHERE data = %s AND horario = %s", (data, horario))
+        cursor.execute("SELECT COUNT(*) FROM bloqueios WHERE data = ? AND horario = ?", (data, horario))
         bloqueado = cursor.fetchone()[0]
 
         if agendado > 0 or bloqueado > 0:
             conn.close()
             return "Horário indisponível. Por favor, escolha outro.", 400
 
-        cursor.execute("INSERT INTO agendamentos (nome, telefone, data, horario, servico) VALUES (%s, %s, %s, %s, %s)",
-                       (nome, telefone, data, horario, servico))
+        cursor.execute(
+            "INSERT INTO agendamentos (nome, telefone, data, horario, servico) VALUES (?, ?, ?, ?, ?)",
+            (nome, telefone, data, horario, servico)
+        )
         conn.commit()
         conn.close()
 
         return render_template("confirmacao.html", nome=nome, telefone=telefone, data=data, horario=horario, servico=servico)
+
     else:
         data_selecionada = request.args.get('data') or datetime.date.today().isoformat()
 
         conn = conectar_bd()
         cursor = conn.cursor()
-        cursor.execute("SELECT horario FROM agendamentos WHERE data = %s", (data_selecionada,))
-        agendados = {row[0] for row in cursor.fetchall()}
 
-        cursor.execute("SELECT horario FROM bloqueios WHERE data = %s", (data_selecionada,))
-        bloqueados = {row[0] for row in cursor.fetchall()}
+        cursor.execute("SELECT horario FROM agendamentos WHERE data = ?", (data_selecionada,))
+        agendados = {row["horario"] for row in cursor.fetchall()}
+
+        cursor.execute("SELECT horario FROM bloqueios WHERE data = ?", (data_selecionada,))
+        bloqueados = {row["horario"] for row in cursor.fetchall()}
+
         conn.close()
 
         horarios_disponiveis = [h for h in HORARIOS_POSSIVEIS if h not in agendados and h not in bloqueados]
@@ -170,8 +168,20 @@ def listar_agendamentos():
     cursor = conn.cursor()
     cursor.execute("SELECT id, nome, telefone, data, horario, servico FROM agendamentos ORDER BY data, horario")
     agendamentos = cursor.fetchall()
+    hoje = datetime.date.today().isoformat()
+
+    cursor.execute("SELECT COUNT(*) FROM agendamentos WHERE data = ?", (hoje,))
+    total_hoje = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM agendamentos")
+    total_geral = cursor.fetchone()[0]
     conn.close()
-    return render_template("agendamentos.html", agendamentos=agendamentos)
+    return render_template(
+        "agendamentos.html",
+        agendamentos=agendamentos,
+        total_hoje=total_hoje,
+        total_geral=total_geral
+    )
 
 @app.route("/editar/<int:id>", methods=["GET", "POST"])
 @login_requerido
@@ -188,14 +198,15 @@ def editar_agendamento(id):
 
         cursor.execute('''
             UPDATE agendamentos
-            SET nome = %s, telefone = %s, data = %s, horario = %s, servico = %s
-            WHERE id = %s
+            SET nome = ?, telefone = ?, data = ?, horario = ?, servico = ?
+            WHERE id = ?
         ''', (nome, telefone, data, horario, servico, id))
+
         conn.commit()
         conn.close()
         return redirect("/agendamentos")
 
-    cursor.execute("SELECT * FROM agendamentos WHERE id = %s", (id,))
+    cursor.execute("SELECT * FROM agendamentos WHERE id = ?", (id,))
     agendamento = cursor.fetchone()
     conn.close()
     return render_template("editar.html", agendamento=agendamento)
@@ -205,7 +216,7 @@ def editar_agendamento(id):
 def excluir_agendamento(id):
     conn = conectar_bd()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM agendamentos WHERE id = %s", (id,))
+    cursor.execute("DELETE FROM agendamentos WHERE id = ?", (id,))
     conn.commit()
     conn.close()
     return redirect("/agendamentos")
@@ -224,6 +235,7 @@ def listar_bloqueios():
 @login_requerido
 def novo_bloqueio():
     horarios = HORARIOS_POSSIVEIS
+
     if request.method == "POST":
         data = request.form["data"]
         horario = request.form["horario"]
@@ -231,7 +243,7 @@ def novo_bloqueio():
 
         conn = conectar_bd()
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO bloqueios (data, horario, motivo) VALUES (%s, %s, %s)", (data, horario, motivo))
+        cursor.execute("INSERT INTO bloqueios (data, horario, motivo) VALUES (?, ?, ?)", (data, horario, motivo))
         conn.commit()
         conn.close()
         return redirect("/bloqueios")
@@ -243,7 +255,7 @@ def novo_bloqueio():
 def excluir_bloqueio(id):
     conn = conectar_bd()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM bloqueios WHERE id = %s", (id,))
+    cursor.execute("DELETE FROM bloqueios WHERE id = ?", (id,))
     conn.commit()
     conn.close()
     return redirect("/bloqueios")
@@ -252,6 +264,9 @@ def excluir_bloqueio(id):
 # INICIAR SERVIDOR
 # -------------------
 if __name__ == "__main__":
-    criar_tabelas_postgres()
+    criar_tabelas()
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    import os
+
+    print("RODANDO ESSE APP:", os.path.abspath(__file__))
+    app.run(host="0.0.0.0", port=port)
