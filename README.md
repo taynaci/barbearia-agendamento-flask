@@ -9,7 +9,8 @@ Projeto desenvolvido com Flask e SQLite para gerenciamento de horários.
 - HTML/CSS
 
 ## Preview
-(coloca print aqui)
+<img width="1366" height="768" alt="image" src="https://github.com/user-attachments/assets/957bda0c-bc52-4876-bfa8-d058c3ddd68c" />
+
 
 ## Como rodar
 ```bash
